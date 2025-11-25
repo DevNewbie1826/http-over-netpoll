@@ -5,7 +5,7 @@ import (
 	"log"
 	"time"
 
-	"netpollAdaptor/pkg/engine"
+	"github.com/DevNewbie1826/http-over-netpoll/pkg/engine"
 
 	"github.com/cloudwego/netpoll"
 	"github.com/valyala/fasthttp/reuseport"

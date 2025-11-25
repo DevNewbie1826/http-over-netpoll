@@ -68,8 +68,8 @@ package main
 
 import (
     "net/http"
-    "netpollAdaptor/pkg/engine"
-    "netpollAdaptor/pkg/server"
+    "github.com/DevNewbie1826/http-over-netpoll/pkg/engine"
+    "github.com/DevNewbie1826/http-over-netpoll/pkg/server"
 )
 
 func main() {

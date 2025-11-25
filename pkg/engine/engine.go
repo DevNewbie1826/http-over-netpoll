@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"time"
 
-	"netpollAdaptor/pkg/adaptor"
-	"netpollAdaptor/pkg/appcontext"
+	"github.com/DevNewbie1826/http-over-netpoll/pkg/adaptor"
+	"github.com/DevNewbie1826/http-over-netpoll/pkg/appcontext"
 
 	"github.com/cloudwego/netpoll"
 )

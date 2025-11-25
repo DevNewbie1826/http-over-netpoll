@@ -13,8 +13,8 @@ import (
 
 	"github.com/cloudwego/netpoll"
 
-	"netpollAdaptor/pkg/appcontext"
-	"netpollAdaptor/pkg/bytebufferpool"
+	"github.com/DevNewbie1826/http-over-netpoll/pkg/appcontext"
+	"github.com/DevNewbie1826/http-over-netpoll/pkg/bytebufferpool"
 )
 
 var errHijacked = errors.New("connection has been hijacked")

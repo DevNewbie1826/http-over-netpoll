@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"time"
 
-	"netpollAdaptor/pkg/engine"
-	"netpollAdaptor/pkg/server"
+	"github.com/DevNewbie1826/http-over-netpoll/pkg/engine"
+	"github.com/DevNewbie1826/http-over-netpoll/pkg/server"
 
 	"github.com/lxzan/gws"
 

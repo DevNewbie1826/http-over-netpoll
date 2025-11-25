@@ -1,4 +1,4 @@
-module netpollAdaptor
+module github.com/DevNewbie1826/http-over-netpoll
 
 go 1.25.4
 

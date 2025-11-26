@@ -28,6 +28,7 @@ type ResponseWriter struct {
 	statusCode  int
 	wroteHeader bool
 	hijacked    bool
+	chunked     bool
 	body        *bytebufferpool.ByteBuffer
 }
 
@@ -59,6 +60,7 @@ func NewResponseWriter(ctx *appcontext.RequestContext, req *http.Request) *Respo
 	rw.statusCode = 0
 	rw.wroteHeader = false
 	rw.hijacked = false
+	rw.chunked = false
 	rw.body = bytebufferpool.Get()
 
 	// No need to re-allocate header map; it is cleared in Release().
@@ -219,6 +221,7 @@ func (rw *ResponseWriter) writeHeaders(writer netpoll.Writer, isStreaming bool) 
 	buf.WriteString("\r\n")
 
 	if isStreaming {
+		rw.chunked = true
 		buf.WriteString("Transfer-Encoding: chunked\r\n")
 		rw.header.Del("Content-Length")
 		rw.header.Del("Transfer-Encoding") // Avoid duplication if already set
@@ -262,7 +265,7 @@ func (rw *ResponseWriter) EndResponse() error {
 		rw.writeHeaders(writer, isStreaming)
 	}
 
-	if isStreaming {
+	if rw.chunked {
 		if rw.body.Len() > 0 {
 			chunkHeader := strconv.FormatInt(int64(rw.body.Len()), 16) + "\r\n"
 			writer.WriteString(chunkHeader)

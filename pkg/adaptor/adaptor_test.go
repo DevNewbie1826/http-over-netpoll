@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
@@ -17,10 +18,26 @@ import (
 type mockConn struct {
 	netpoll.Connection
 	w netpoll.Writer
+	r io.Reader // Add reader support
 }
 
 func (m *mockConn) Writer() netpoll.Writer {
 	return m.w
+}
+
+// Implement Read to avoid panic when bufio.NewReader reads from conn
+func (m *mockConn) Read(p []byte) (n int, err error) {
+	if m.r != nil {
+		return m.r.Read(p)
+	}
+	return 0, io.EOF
+}
+
+func (m *mockConn) RemoteAddr() net.Addr {
+	return &net.TCPAddr{
+		IP:   net.ParseIP("127.0.0.1"),
+		Port: 8080,
+	}
 }
 
 // onlyReader implements only io.Reader, hiding io.WriterTo.

@@ -342,14 +342,16 @@ func (rw *ResponseWriter) EndResponse() error {
 		if !noBody && rw.body.Len() > 0 {
 			if _, err := writer.WriteBinary(rw.body.Bytes()); err != nil {
 				bytebufferpool.Put(rw.body)
+				rw.body = nil
 				return err
 			}
 		}
 	}
 
+	err := writer.Flush()
 	bytebufferpool.Put(rw.body)
 	rw.body = nil
-	return writer.Flush()
+	return err
 }
 
 func GetRequest(ctx *appcontext.RequestContext) (*http.Request, error) {
@@ -363,7 +365,12 @@ func GetRequest(ctx *appcontext.RequestContext) (*http.Request, error) {
 	}
 	req.URL.Scheme = "http"
 	req.URL.Host = req.Host
-	req.RemoteAddr = ctx.Conn().RemoteAddr().String()
+	req.RequestURI = req.URL.RequestURI() // Fix: Ensure RequestURI is set properly
+
+	// Fix: Ensure RemoteAddr is set properly
+	if addr := ctx.Conn().RemoteAddr(); addr != nil {
+		req.RemoteAddr = addr.String()
+	}
 
 	return req, nil
 }

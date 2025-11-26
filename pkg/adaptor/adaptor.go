@@ -267,7 +267,10 @@ func (rw *ResponseWriter) writeHeaders(writer netpoll.Writer, isStreaming bool) 
 	buf.WriteString(http.StatusText(rw.statusCode))
 	buf.WriteString("\r\n")
 
-	if isStreaming {
+	// RFC 7230: Status codes 1xx, 204, and 304 MUST NOT have a response body.
+	noBody := rw.statusCode >= 100 && rw.statusCode < 200 || rw.statusCode == 204 || rw.statusCode == 304
+
+	if isStreaming && !noBody {
 		rw.chunked = true
 		buf.WriteString("Transfer-Encoding: chunked\r\n")
 		rw.header.Del("Content-Length")
@@ -277,8 +280,9 @@ func (rw *ResponseWriter) writeHeaders(writer netpoll.Writer, isStreaming bool) 
 		// Only set Content-Length if not already set (e.g. by ServeFile)
 		// and if body exists.
 		// Content-Length가 아직 설정되지 않았고 (예: ServeFile에 의해), 본문이 존재하는 경우에만 설정합니다.
-		if _, ok := rw.header["Content-Length"]; !ok {
-			if rw.body.Len() > 0 {
+		if rw.header.Get("Content-Length") == "" {
+			// For 304, we also skip adding Content-Length if not set, to avoid overwriting cache metadata with 0.
+			if !noBody {
 				rw.header.Set("Content-Length", strconv.Itoa(rw.body.Len()))
 			}
 		}
@@ -315,16 +319,27 @@ func (rw *ResponseWriter) EndResponse() error {
 		rw.writeHeaders(writer, isStreaming)
 	}
 
+	// RFC 7230: Status codes 1xx, 204, and 304 MUST NOT have a response body.
+	noBody := rw.statusCode >= 100 && rw.statusCode < 200 || rw.statusCode == 204 || rw.statusCode == 304
+
 	if rw.chunked {
-		if rw.body.Len() > 0 {
+		// Note: Using chunked encoding with 204/304 is generally invalid, but if the user
+		// triggered it via Flush(), headers are already sent. We should at least
+		// prevent sending body data if noBody is true.
+		if !noBody && rw.body.Len() > 0 {
 			chunkHeader := strconv.FormatInt(int64(rw.body.Len()), 16) + "\r\n"
 			writer.WriteString(chunkHeader)
 			writer.WriteBinary(rw.body.Bytes())
 			writer.WriteString("\r\n")
 		}
+		// Zero chunk must be sent to terminate chunked stream, even for noBody?
+		// Technically 204 should not have Transfer-Encoding either.
+		// But if we are here, headers are likely already sent with Transfer-Encoding.
+		// Sending zero chunk is safer to keep connection in sync than hanging.
 		writer.WriteString("0\r\n\r\n")
 	} else {
-		if rw.body.Len() > 0 {
+		// Fixed Length or No Body
+		if !noBody && rw.body.Len() > 0 {
 			if _, err := writer.WriteBinary(rw.body.Bytes()); err != nil {
 				bytebufferpool.Put(rw.body)
 				return err

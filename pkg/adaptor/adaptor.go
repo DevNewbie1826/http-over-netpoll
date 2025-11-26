@@ -74,7 +74,10 @@ func NewResponseWriter(ctx *appcontext.RequestContext, req *http.Request) *Respo
 func (rw *ResponseWriter) Release() {
 	rw.ctx = nil
 	rw.req = nil
-	rw.body = nil // body is released in EndResponse
+	if rw.body != nil {
+		bytebufferpool.Put(rw.body)
+		rw.body = nil
+	}
 
 	// Clear the header map for reuse, avoiding re-allocation overhead.
 	// 재사용을 위해 헤더 맵을 초기화하여 재할당 오버헤드를 방지합니다.
@@ -123,12 +126,56 @@ func (rw *ResponseWriter) ReadFrom(r io.Reader) (n int64, err error) {
 		if rw.statusCode == 0 {
 			rw.statusCode = http.StatusOK
 		}
-		rw.writeHeaders(writer, false)
+
+		// Check if Content-Length is explicitly set or Transfer-Encoding is explicitly chunked
+		_, hasCL := rw.header["Content-Length"]
+		hasChunked := rw.header.Get("Transfer-Encoding") == "chunked"
+		shouldChunk := !hasCL && !hasChunked
+		if hasChunked {
+			shouldChunk = true
+		}
+
+		rw.writeHeaders(writer, shouldChunk)
+
 		// Must flush headers before attempting to send file data
 		// 파일 데이터를 전송하기 전에 반드시 헤더를 플러시해야 합니다.
 		if err := writer.Flush(); err != nil {
 			return 0, err
 		}
+	}
+
+	// If chunked, we must manually chunk the data from reader.
+	// Zero-Copy (ReaderFrom) cannot be easily used with chunked encoding because we need to insert length headers.
+	if rw.chunked {
+		bufp := copyBufPool.Get().(*[]byte)
+		buf := *bufp
+		defer copyBufPool.Put(bufp)
+
+		for {
+			nr, er := r.Read(buf)
+			if nr > 0 {
+				// Write chunk header: "Size\r\n"
+				chunkHeader := strconv.FormatInt(int64(nr), 16) + "\r\n"
+				writer.WriteString(chunkHeader)
+				writer.WriteBinary(buf[:nr])
+				writer.WriteString("\r\n")
+				// Flush immediately to send chunk and prevent buffering huge files in memory.
+				if err := writer.Flush(); err != nil {
+					return n, err
+				}
+			}
+			if er != nil {
+				if er != io.EOF {
+					err = er
+				}
+				break
+			}
+		}
+		// Flush after writing all chunks (except zero chunk, which EndResponse handles)
+		if fErr := writer.Flush(); fErr != nil && err == nil {
+			err = fErr
+		}
+		return n, err
 	}
 
 	// Attempt to use io.ReaderFrom (sendfile-like optimization)
@@ -262,6 +309,9 @@ func (rw *ResponseWriter) EndResponse() error {
 	isStreaming := rw.header.Get("Transfer-Encoding") == "chunked"
 
 	if !rw.wroteHeader {
+		if rw.statusCode == 0 {
+			rw.statusCode = http.StatusOK
+		}
 		rw.writeHeaders(writer, isStreaming)
 	}
 
@@ -283,6 +333,7 @@ func (rw *ResponseWriter) EndResponse() error {
 	}
 
 	bytebufferpool.Put(rw.body)
+	rw.body = nil
 	return writer.Flush()
 }
 

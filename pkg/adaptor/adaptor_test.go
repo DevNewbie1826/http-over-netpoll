@@ -1,0 +1,211 @@
+package adaptor
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"net/http"
+	"strings"
+	"testing"
+
+	"github.com/cloudwego/netpoll"
+	"github.com/DevNewbie1826/http-over-netpoll/pkg/appcontext"
+)
+
+// mockConn embeds netpoll.Connection to satisfy the interface.
+// It will panic if any non-overridden method is called.
+type mockConn struct {
+	netpoll.Connection
+	w netpoll.Writer
+}
+
+func (m *mockConn) Writer() netpoll.Writer {
+	return m.w
+}
+
+// onlyReader implements only io.Reader, hiding io.WriterTo.
+// This forces io.Copy to use ReadFrom instead of WriteTo.
+type onlyReader struct {
+	io.Reader
+}
+
+func TestChunkedEncoding_EndResponse(t *testing.T) {
+	// Case 1: Manual Transfer-Encoding: chunked
+	var buf bytes.Buffer
+	mw := netpoll.NewWriter(&buf)
+	mc := &mockConn{w: mw}
+	ctx := appcontext.NewRequestContext(mc, context.Background())
+	req, _ := http.NewRequest("GET", "/", nil)
+
+	rw := NewResponseWriter(ctx, req)
+	rw.Header().Set("Transfer-Encoding", "chunked")
+	rw.Write([]byte("hello"))
+	err := rw.EndResponse()
+	if err != nil {
+		t.Fatalf("EndResponse failed: %v", err)
+	}
+
+	// We expect the output to contain "0\r\n\r\n" at the end.
+	output := buf.String()
+	expectedZeroChunk := "0\r\n\r\n"
+	if !bytes.Contains(buf.Bytes(), []byte(expectedZeroChunk)) {
+		t.Errorf("Expected zero chunk in output, got: %q", output)
+	}
+}
+
+func TestChunkedEncoding_Flush(t *testing.T) {
+	// Case 2: Flush() calling writeHeaders
+	var buf bytes.Buffer
+	mw := netpoll.NewWriter(&buf)
+	mc := &mockConn{w: mw}
+	ctx := appcontext.NewRequestContext(mc, context.Background())
+	req, _ := http.NewRequest("GET", "/", nil)
+
+	rw := NewResponseWriter(ctx, req)
+
+	rw.Write([]byte("part1"))
+	rw.Flush() // Should trigger chunked headers
+
+	rw.Write([]byte("part2"))
+	err := rw.EndResponse() // Should write zero chunk
+	if err != nil {
+		t.Fatalf("EndResponse failed: %v", err)
+	}
+
+	output := buf.String()
+	expectedZeroChunk := "0\r\n\r\n"
+	if !bytes.Contains(buf.Bytes(), []byte(expectedZeroChunk)) {
+		t.Errorf("Expected zero chunk in output, got: %q", output)
+	}
+}
+
+func TestNormalResponse(t *testing.T) {
+	// Case 3: Normal response
+	var buf bytes.Buffer
+	mw := netpoll.NewWriter(&buf)
+	mc := &mockConn{w: mw}
+	ctx := appcontext.NewRequestContext(mc, context.Background())
+	req, _ := http.NewRequest("GET", "/", nil)
+
+	rw := NewResponseWriter(ctx, req)
+	rw.Write([]byte("hello"))
+	err := rw.EndResponse()
+	if err != nil {
+		t.Fatalf("EndResponse failed: %v", err)
+	}
+
+	output := buf.String()
+	if bytes.Contains(buf.Bytes(), []byte("Transfer-Encoding: chunked")) {
+		t.Errorf("Did not expect chunked header in output, got: %q", output)
+	}
+	// Content-Length should be present (5)
+	if !bytes.Contains(buf.Bytes(), []byte("Content-Length: 5")) {
+		t.Errorf("Expected Content-Length: 5, got: %q", output)
+	}
+}
+
+func TestReadFrom_ContentLength_Missing(t *testing.T) {
+	var buf bytes.Buffer
+	mw := netpoll.NewWriter(&buf)
+	mc := &mockConn{w: mw}
+	ctx := appcontext.NewRequestContext(mc, context.Background())
+	req, _ := http.NewRequest("GET", "/", nil)
+
+	rw := NewResponseWriter(ctx, req)
+
+	srcData := "0123456789"
+	// Wrap in onlyReader to hide WriterTo interface -> forces rw.ReadFrom call
+	src := &onlyReader{Reader: strings.NewReader(srcData)}
+
+	// rw.ReadFrom is called
+	_, err := io.Copy(rw, src)
+	if err != nil {
+		t.Fatalf("io.Copy failed: %v", err)
+	}
+
+	rw.EndResponse()
+
+	output := buf.String()
+	t.Logf("Output Headers:\n%s", output)
+
+	hasContentLength := strings.Contains(output, "Content-Length:")
+	hasChunked := strings.Contains(output, "Transfer-Encoding: chunked")
+
+	// Expectation: Since rw.body is empty and no CL set, it MUST switch to Chunked.
+	if !hasContentLength && !hasChunked {
+		t.Errorf("Critical Bug: Response has neither Content-Length nor Transfer-Encoding: chunked.")
+	}
+	if !hasChunked {
+		t.Errorf("Expected chunked encoding when Content-Length is missing in ReadFrom.")
+	}
+
+	// Check for chunked data format: 'a\r\n0123456789\r\n'
+	// 'a' is hex for 10.
+	if !strings.Contains(output, "\r\na\r\n") {
+		t.Errorf("Body does not appear to be chunked properly (missing size header 'a').")
+	}
+}
+
+func TestReadFrom_WithContentLength(t *testing.T) {
+	// If Content-Length is set, should NOT use chunked and treat as fixed length (Zero-Copy path)
+	var buf bytes.Buffer
+	mw := netpoll.NewWriter(&buf)
+	mc := &mockConn{w: mw}
+	ctx := appcontext.NewRequestContext(mc, context.Background())
+	req, _ := http.NewRequest("GET", "/", nil)
+
+	rw := NewResponseWriter(ctx, req)
+
+	srcData := "0123456789"
+	src := &onlyReader{Reader: strings.NewReader(srcData)}
+
+	// Manually set Content-Length
+	rw.Header().Set("Content-Length", "10")
+
+	_, err := io.Copy(rw, src)
+	if err != nil {
+		t.Fatalf("io.Copy failed: %v", err)
+	}
+
+	rw.EndResponse()
+
+	output := buf.String()
+	t.Logf("Output Headers:\n%s", output)
+
+	if strings.Contains(output, "Transfer-Encoding: chunked") {
+		t.Errorf("Should NOT use chunked encoding when Content-Length is set.")
+	}
+	if !strings.Contains(output, "Content-Length: 10") {
+		t.Errorf("Content-Length header missing.")
+	}
+	// Chunk header (size) should NOT be in body
+	if strings.Contains(output, "\r\na\r\n") {
+		t.Errorf("Body seems to be chunked (found chunk size 'a').")
+	}
+}
+
+func TestEmptyHandler_StatusCode(t *testing.T) {
+	// If handler writes nothing, it should imply 200 OK
+	var buf bytes.Buffer
+	mw := netpoll.NewWriter(&buf)
+	mc := &mockConn{w: mw}
+	ctx := appcontext.NewRequestContext(mc, context.Background())
+	req, _ := http.NewRequest("GET", "/", nil)
+
+	rw := NewResponseWriter(ctx, req)
+	// Do nothing
+
+	err := rw.EndResponse()
+	if err != nil {
+		t.Fatalf("EndResponse failed: %v", err)
+	}
+
+	output := buf.String()
+	// Should be "HTTP/1.1 200 OK" not "HTTP/1.1 0"
+	if strings.Contains(output, "HTTP/1.1 0") {
+		t.Errorf("Bug: Status code is 0. Output: %q", output)
+	}
+	if !strings.Contains(output, "HTTP/1.1 200 OK") {
+		t.Errorf("Expected 200 OK, got: %q", output)
+	}
+}

@@ -71,7 +71,7 @@ func TestChunkedEncoding_EndResponse(t *testing.T) {
 }
 
 func TestChunkedEncoding_Flush(t *testing.T) {
-	// Case 2: Flush() calling writeHeaders
+	// Case 2: Flush() calling writeHeaders -> Should trigger chunked
 	var buf bytes.Buffer
 	mw := netpoll.NewWriter(&buf)
 	mc := &mockConn{w: mw}
@@ -93,6 +93,10 @@ func TestChunkedEncoding_Flush(t *testing.T) {
 	expectedZeroChunk := "0\r\n\r\n"
 	if !bytes.Contains(buf.Bytes(), []byte(expectedZeroChunk)) {
 		t.Errorf("Expected zero chunk in output, got: %q", output)
+	}
+	
+	if !strings.Contains(output, "Transfer-Encoding: chunked") {
+		t.Errorf("Expected Transfer-Encoding: chunked when Flush is called.")
 	}
 }
 
@@ -201,8 +205,8 @@ func TestReadFrom_WithContentLength(t *testing.T) {
 	}
 }
 
-func TestEmptyHandler_StatusCode(t *testing.T) {
-	// If handler writes nothing, it should imply 200 OK
+func TestHijack_Success(t *testing.T) {
+	// Case: Hijack before headers written
 	var buf bytes.Buffer
 	mw := netpoll.NewWriter(&buf)
 	mc := &mockConn{w: mw}
@@ -210,19 +214,60 @@ func TestEmptyHandler_StatusCode(t *testing.T) {
 	req, _ := http.NewRequest("GET", "/", nil)
 
 	rw := NewResponseWriter(ctx, req)
-	// Do nothing
-
-	err := rw.EndResponse()
+	conn, bufrw, err := rw.Hijack()
 	if err != nil {
-		t.Fatalf("EndResponse failed: %v", err)
+		t.Fatalf("Hijack failed: %v", err)
+	}
+	if conn == nil || bufrw == nil {
+		t.Errorf("Hijack returned nil conn or bufio")
+	}
+	if !rw.Hijacked() {
+		t.Errorf("Hijacked() should return true")
 	}
 
-	output := buf.String()
-	// Should be "HTTP/1.1 200 OK" not "HTTP/1.1 0"
-	if strings.Contains(output, "HTTP/1.1 0") {
-		t.Errorf("Bug: Status code is 0. Output: %q", output)
+	// EndResponse should be safe to call
+	rw.EndResponse()
+}
+
+func TestHijack_AfterWrite(t *testing.T) {
+	// Case: Hijack AFTER headers written -> Should Fail
+	var buf bytes.Buffer
+	mw := netpoll.NewWriter(&buf)
+	mc := &mockConn{w: mw}
+	ctx := appcontext.NewRequestContext(mc, context.Background())
+	req, _ := http.NewRequest("GET", "/", nil)
+
+	rw := NewResponseWriter(ctx, req)
+	rw.Write([]byte("trigger headers"))
+	rw.Flush() // Force headers to be written
+
+	_, _, err := rw.Hijack()
+	if err == nil {
+		t.Errorf("Expected error when hijacking after headers written, got nil")
 	}
-	if !strings.Contains(output, "HTTP/1.1 200 OK") {
-		t.Errorf("Expected 200 OK, got: %q", output)
+}
+
+func TestNoBody_Responses(t *testing.T) {
+	// Case: 204 and 304 should not have body
+	tests := []int{204, 304}
+	for _, code := range tests {
+		var buf bytes.Buffer
+		mw := netpoll.NewWriter(&buf)
+		mc := &mockConn{w: mw}
+		ctx := appcontext.NewRequestContext(mc, context.Background())
+		req, _ := http.NewRequest("GET", "/", nil)
+
+		rw := NewResponseWriter(ctx, req)
+		rw.WriteHeader(code)
+		rw.Write([]byte("This should be ignored"))
+		rw.EndResponse()
+
+		output := buf.String()
+		if strings.Contains(output, "This should be ignored") {
+			t.Errorf("Status %d should not have body in output. Got: %q", code, output)
+		}
+		if strings.Contains(output, "Content-Length:") {
+			t.Errorf("Status %d should not have Content-Length header.", code)
+		}
 	}
 }

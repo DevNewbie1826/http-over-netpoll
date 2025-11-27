@@ -225,6 +225,9 @@ func (rw *ResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if rw.hijacked {
 		return nil, nil, errHijacked
 	}
+	if rw.wroteHeader {
+		return nil, nil, errors.New("hijack not allowed after headers written")
+	}
 	rw.hijacked = true
 	conn := rw.ctx.Conn()
 	return conn, bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn)), nil
@@ -305,7 +308,10 @@ func (rw *ResponseWriter) writeHeaders(writer netpoll.Writer, isStreaming bool) 
 
 func (rw *ResponseWriter) EndResponse() error {
 	if rw.hijacked {
-		bytebufferpool.Put(rw.body)
+		if rw.body != nil {
+			bytebufferpool.Put(rw.body)
+			rw.body = nil
+		}
 		return nil
 	}
 

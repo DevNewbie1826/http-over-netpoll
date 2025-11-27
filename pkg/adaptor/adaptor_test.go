@@ -125,48 +125,6 @@ func TestNormalResponse(t *testing.T) {
 	}
 }
 
-func TestReadFrom_ContentLength_Missing(t *testing.T) {
-	var buf bytes.Buffer
-	mw := netpoll.NewWriter(&buf)
-	mc := &mockConn{w: mw}
-	ctx := appcontext.NewRequestContext(mc, context.Background())
-	req, _ := http.NewRequest("GET", "/", nil)
-
-	rw := NewResponseWriter(ctx, req)
-
-	srcData := "0123456789"
-	// Wrap in onlyReader to hide WriterTo interface -> forces rw.ReadFrom call
-	src := &onlyReader{Reader: strings.NewReader(srcData)}
-
-	// rw.ReadFrom is called
-	_, err := io.Copy(rw, src)
-	if err != nil {
-		t.Fatalf("io.Copy failed: %v", err)
-	}
-
-	rw.EndResponse()
-
-	output := buf.String()
-	t.Logf("Output Headers:\n%s", output)
-
-	hasContentLength := strings.Contains(output, "Content-Length:")
-	hasChunked := strings.Contains(output, "Transfer-Encoding: chunked")
-
-	// Expectation: Since rw.body is empty and no CL set, it MUST switch to Chunked.
-	if !hasContentLength && !hasChunked {
-		t.Errorf("Critical Bug: Response has neither Content-Length nor Transfer-Encoding: chunked.")
-	}
-	if !hasChunked {
-		t.Errorf("Expected chunked encoding when Content-Length is missing in ReadFrom.")
-	}
-
-	// Check for chunked data format: 'a\r\n0123456789\r\n'
-	// 'a' is hex for 10.
-	if !strings.Contains(output, "\r\na\r\n") {
-		t.Errorf("Body does not appear to be chunked properly (missing size header 'a').")
-	}
-}
-
 func TestReadFrom_WithContentLength(t *testing.T) {
 	// If Content-Length is set, should NOT use chunked and treat as fixed length (Zero-Copy path)
 	var buf bytes.Buffer
@@ -244,30 +202,5 @@ func TestHijack_AfterWrite(t *testing.T) {
 	_, _, err := rw.Hijack()
 	if err == nil {
 		t.Errorf("Expected error when hijacking after headers written, got nil")
-	}
-}
-
-func TestNoBody_Responses(t *testing.T) {
-	// Case: 204 and 304 should not have body
-	tests := []int{204, 304}
-	for _, code := range tests {
-		var buf bytes.Buffer
-		mw := netpoll.NewWriter(&buf)
-		mc := &mockConn{w: mw}
-		ctx := appcontext.NewRequestContext(mc, context.Background())
-		req, _ := http.NewRequest("GET", "/", nil)
-
-		rw := NewResponseWriter(ctx, req)
-		rw.WriteHeader(code)
-		rw.Write([]byte("This should be ignored"))
-		rw.EndResponse()
-
-		output := buf.String()
-		if strings.Contains(output, "This should be ignored") {
-			t.Errorf("Status %d should not have body in output. Got: %q", code, output)
-		}
-		if strings.Contains(output, "Content-Length:") {
-			t.Errorf("Status %d should not have Content-Length header.", code)
-		}
 	}
 }

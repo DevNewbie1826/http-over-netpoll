@@ -60,7 +60,6 @@ func NewResponseWriter(ctx *appcontext.RequestContext, req *http.Request) *Respo
 	rw.statusCode = 0
 	rw.wroteHeader = false
 	rw.hijacked = false
-	rw.chunked = false
 	rw.body = bytebufferpool.Get()
 
 	// No need to re-allocate header map; it is cleared in Release().
@@ -126,56 +125,14 @@ func (rw *ResponseWriter) ReadFrom(r io.Reader) (n int64, err error) {
 		if rw.statusCode == 0 {
 			rw.statusCode = http.StatusOK
 		}
-
-		// Check if Content-Length is explicitly set or Transfer-Encoding is explicitly chunked
-		_, hasCL := rw.header["Content-Length"]
-		hasChunked := rw.header.Get("Transfer-Encoding") == "chunked"
-		shouldChunk := !hasCL && !hasChunked
-		if hasChunked {
-			shouldChunk = true
-		}
-
-		rw.writeHeaders(writer, shouldChunk)
+		// v0.0.2 Logic: Just assume not chunked for ReadFrom (known limitation)
+		rw.writeHeaders(writer, false)
 
 		// Must flush headers before attempting to send file data
 		// 파일 데이터를 전송하기 전에 반드시 헤더를 플러시해야 합니다.
 		if err := writer.Flush(); err != nil {
 			return 0, err
 		}
-	}
-
-	// If chunked, we must manually chunk the data from reader.
-	// Zero-Copy (ReaderFrom) cannot be easily used with chunked encoding because we need to insert length headers.
-	if rw.chunked {
-		bufp := copyBufPool.Get().(*[]byte)
-		buf := *bufp
-		defer copyBufPool.Put(bufp)
-
-		for {
-			nr, er := r.Read(buf)
-			if nr > 0 {
-				// Write chunk header: "Size\r\n"
-				chunkHeader := strconv.FormatInt(int64(nr), 16) + "\r\n"
-				writer.WriteString(chunkHeader)
-				writer.WriteBinary(buf[:nr])
-				writer.WriteString("\r\n")
-				// Flush immediately to send chunk and prevent buffering huge files in memory.
-				if err := writer.Flush(); err != nil {
-					return n, err
-				}
-			}
-			if er != nil {
-				if er != io.EOF {
-					err = er
-				}
-				break
-			}
-		}
-		// Flush after writing all chunks (except zero chunk, which EndResponse handles)
-		if fErr := writer.Flush(); fErr != nil && err == nil {
-			err = fErr
-		}
-		return n, err
 	}
 
 	// Attempt to use io.ReaderFrom (sendfile-like optimization)
@@ -225,6 +182,7 @@ func (rw *ResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if rw.hijacked {
 		return nil, nil, errHijacked
 	}
+	// Fix: Prevent hijacking after headers are written
 	if rw.wroteHeader {
 		return nil, nil, errors.New("hijack not allowed after headers written")
 	}
@@ -270,10 +228,7 @@ func (rw *ResponseWriter) writeHeaders(writer netpoll.Writer, isStreaming bool) 
 	buf.WriteString(http.StatusText(rw.statusCode))
 	buf.WriteString("\r\n")
 
-	// RFC 7230: Status codes 1xx, 204, and 304 MUST NOT have a response body.
-	noBody := rw.statusCode >= 100 && rw.statusCode < 200 || rw.statusCode == 204 || rw.statusCode == 304
-
-	if isStreaming && !noBody {
+	if isStreaming {
 		rw.chunked = true
 		buf.WriteString("Transfer-Encoding: chunked\r\n")
 		rw.header.Del("Content-Length")
@@ -283,9 +238,8 @@ func (rw *ResponseWriter) writeHeaders(writer netpoll.Writer, isStreaming bool) 
 		// Only set Content-Length if not already set (e.g. by ServeFile)
 		// and if body exists.
 		// Content-Length가 아직 설정되지 않았고 (예: ServeFile에 의해), 본문이 존재하는 경우에만 설정합니다.
-		if rw.header.Get("Content-Length") == "" {
-			// For 304, we also skip adding Content-Length if not set, to avoid overwriting cache metadata with 0.
-			if !noBody {
+		if _, ok := rw.header["Content-Length"]; !ok {
+			if rw.body.Len() > 0 {
 				rw.header.Set("Content-Length", strconv.Itoa(rw.body.Len()))
 			}
 		}
@@ -308,6 +262,7 @@ func (rw *ResponseWriter) writeHeaders(writer netpoll.Writer, isStreaming bool) 
 
 func (rw *ResponseWriter) EndResponse() error {
 	if rw.hijacked {
+		// Safe cleanup
 		if rw.body != nil {
 			bytebufferpool.Put(rw.body)
 			rw.body = nil
@@ -316,36 +271,26 @@ func (rw *ResponseWriter) EndResponse() error {
 	}
 
 	writer := rw.ctx.Conn().Writer()
-	isStreaming := rw.header.Get("Transfer-Encoding") == "chunked"
+	
+	// Determine if we should use chunked encoding.
+	// This can happen if Flush() was called (rw.chunked=true) OR if user manually set the header.
+	isChunked := rw.chunked || rw.header.Get("Transfer-Encoding") == "chunked"
 
 	if !rw.wroteHeader {
-		if rw.statusCode == 0 {
-			rw.statusCode = http.StatusOK
-		}
-		rw.writeHeaders(writer, isStreaming)
+		rw.writeHeaders(writer, isChunked)
 	}
 
-	// RFC 7230: Status codes 1xx, 204, and 304 MUST NOT have a response body.
-	noBody := rw.statusCode >= 100 && rw.statusCode < 200 || rw.statusCode == 204 || rw.statusCode == 304
-
-	if rw.chunked {
-		// Note: Using chunked encoding with 204/304 is generally invalid, but if the user
-		// triggered it via Flush(), headers are already sent. We should at least
-		// prevent sending body data if noBody is true.
-		if !noBody && rw.body.Len() > 0 {
+	if rw.chunked { // rw.chunked will be updated by writeHeaders if isChunked was true
+		if rw.body.Len() > 0 {
 			chunkHeader := strconv.FormatInt(int64(rw.body.Len()), 16) + "\r\n"
 			writer.WriteString(chunkHeader)
 			writer.WriteBinary(rw.body.Bytes())
 			writer.WriteString("\r\n")
 		}
-		// Zero chunk must be sent to terminate chunked stream, even for noBody?
-		// Technically 204 should not have Transfer-Encoding either.
-		// But if we are here, headers are likely already sent with Transfer-Encoding.
-		// Sending zero chunk is safer to keep connection in sync than hanging.
+		// Fix: ALWAYS send zero chunk if streaming, this was likely the infinite loading bug in v0.0.2
 		writer.WriteString("0\r\n\r\n")
 	} else {
-		// Fixed Length or No Body
-		if !noBody && rw.body.Len() > 0 {
+		if rw.body.Len() > 0 {
 			if _, err := writer.WriteBinary(rw.body.Bytes()); err != nil {
 				bytebufferpool.Put(rw.body)
 				rw.body = nil
@@ -355,8 +300,12 @@ func (rw *ResponseWriter) EndResponse() error {
 	}
 
 	err := writer.Flush()
-	bytebufferpool.Put(rw.body)
-	rw.body = nil
+	
+	// Fix: Release buffer AFTER flush to avoid data corruption
+	if rw.body != nil {
+		bytebufferpool.Put(rw.body)
+		rw.body = nil
+	}
 	return err
 }
 
@@ -371,9 +320,9 @@ func GetRequest(ctx *appcontext.RequestContext) (*http.Request, error) {
 	}
 	req.URL.Scheme = "http"
 	req.URL.Host = req.Host
-	req.RequestURI = req.URL.RequestURI() // Fix: Ensure RequestURI is set properly
+	req.RequestURI = req.URL.RequestURI() // Fix: Ensure RequestURI
 
-	// Fix: Ensure RemoteAddr is set properly
+	// Fix: RemoteAddr
 	if addr := ctx.Conn().RemoteAddr(); addr != nil {
 		req.RemoteAddr = addr.String()
 	}

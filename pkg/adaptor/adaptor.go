@@ -228,21 +228,13 @@ func (rw *ResponseWriter) writeHeaders(writer netpoll.Writer, isStreaming bool) 
 	buf.WriteString(http.StatusText(rw.statusCode))
 	buf.WriteString("\r\n")
 
-	if isStreaming {
+	if isStreaming || rw.header.Get("Content-Length") == "" {
 		rw.chunked = true
 		buf.WriteString("Transfer-Encoding: chunked\r\n")
-		rw.header.Del("Content-Length")
-		rw.header.Del("Transfer-Encoding") // Avoid duplication if already set
-		// 이미 설정되어 있다면 중복을 피하기 위해 Transfer-Encoding을 삭제합니다.
+		rw.header.Del("Content-Length") // Ensure no CL
+		rw.header.Del("Transfer-Encoding")
 	} else {
-		// Only set Content-Length if not already set (e.g. by ServeFile)
-		// and if body exists.
-		// Content-Length가 아직 설정되지 않았고 (예: ServeFile에 의해), 본문이 존재하는 경우에만 설정합니다.
-		if _, ok := rw.header["Content-Length"]; !ok {
-			if rw.body.Len() > 0 {
-				rw.header.Set("Content-Length", strconv.Itoa(rw.body.Len()))
-			}
-		}
+		// User set Content-Length manually, respect it.
 		rw.header.Del("Transfer-Encoding")
 	}
 

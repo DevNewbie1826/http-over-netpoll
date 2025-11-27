@@ -101,7 +101,7 @@ func TestChunkedEncoding_Flush(t *testing.T) {
 }
 
 func TestNormalResponse(t *testing.T) {
-	// Case 3: Normal response
+	// Case 3: Normal response -> Now defaults to Chunked (nbio-like behavior)
 	var buf bytes.Buffer
 	mw := netpoll.NewWriter(&buf)
 	mc := &mockConn{w: mw}
@@ -116,12 +116,16 @@ func TestNormalResponse(t *testing.T) {
 	}
 
 	output := buf.String()
-	if bytes.Contains(buf.Bytes(), []byte("Transfer-Encoding: chunked")) {
-		t.Errorf("Did not expect chunked header in output, got: %q", output)
+	if !strings.Contains(output, "Transfer-Encoding: chunked") {
+		t.Errorf("Expected chunked header in output, got: %q", output)
 	}
-	// Content-Length should be present (5)
-	if !bytes.Contains(buf.Bytes(), []byte("Content-Length: 5")) {
-		t.Errorf("Expected Content-Length: 5, got: %q", output)
+	// Content-Length should NOT be present
+	if strings.Contains(output, "Content-Length:") {
+		t.Errorf("Did not expect Content-Length, got: %q", output)
+	}
+	// Verify chunk format
+	if !strings.Contains(output, "\r\n5\r\nhello\r\n0\r\n\r\n") {
+		t.Errorf("Body chunk format incorrect. Got: %q", output)
 	}
 }
 
